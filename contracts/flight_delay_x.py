@@ -72,6 +72,7 @@ class Contract(gl.Contract):
     policy_count: bigint
     payout_multiplier: bigint       # e.g., 3x premium as default payout
     min_purchase_lead_time: bigint  # Cutoff buffer in seconds before departure (default 3600s)
+    max_settlement_window: bigint   # Maximum window to claim after arrival (default 14 days = 1209600s)
     policies: TreeMap[str, InsurancePolicy]
 
     def __init__(self):
@@ -83,6 +84,7 @@ class Contract(gl.Contract):
         self.policy_count = bigint(0)
         self.payout_multiplier = bigint(3)          # 3x payout multiplier
         self.min_purchase_lead_time = bigint(3600)  # 1 hour cutoff buffer
+        self.max_settlement_window = bigint(1209600) # 14 days settlement window
 
     def _get_current_timestamp(self) -> bigint:
         """Derive trusted timestamp from transaction execution context or datetime."""
@@ -143,8 +145,8 @@ class Contract(gl.Contract):
     ) -> str:
         """
         Passengers buy insurance for a specific flight on a specific date.
-        Enforces purchase before departure cutoff and underwrites strictly
-        against unreserved liquidity.
+        Strictly verifies that buyer-supplied timestamps match the flight date,
+        enforces purchase lead time, and underwrites strictly against unreserved liquidity.
         """
         premium = bigint(gl.message.value)
         if premium <= bigint(0):
@@ -157,14 +159,40 @@ class Contract(gl.Contract):
             raise _UserError("Invalid flight_code format (must be at least 3 characters).")
         _validate_date_format(clean_date)
 
+        # Compute UTC bounds for the specified flight_date
+        flight_dt = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        day_start_ts = bigint(int(flight_dt.timestamp()))
+        day_end_ts = day_start_ts + bigint(86400)
+
+        current_ts = self._get_current_timestamp()
+
+        # Reject historical flight dates outright
+        if day_end_ts <= current_ts:
+            raise _UserError("Cannot purchase policy for a historical flight date.")
+
         dep_ts = bigint(departure_timestamp)
         arr_ts = bigint(arrival_timestamp)
 
-        if dep_ts >= arr_ts:
-            raise _UserError("departure_timestamp must be strictly earlier than arrival_timestamp.")
+        # Strictly verify departure_timestamp against the selected flight_date
+        if dep_ts < day_start_ts or dep_ts >= day_end_ts:
+            raise _UserError(
+                "departure_timestamp does not fall on the selected flight_date. "
+                "Departure must fall within the 24-hour UTC window of the specified date."
+            )
 
-        # Enforce purchase before outcome is known (lead time buffer)
-        current_ts = self._get_current_timestamp()
+        dep_date_str = datetime.fromtimestamp(int(dep_ts), tz=timezone.utc).strftime("%Y-%m-%d")
+        if dep_date_str != clean_date:
+            raise _UserError("departure_timestamp date does not match flight_date.")
+
+        # Scheduled arrival must be realistic (min 30 min, max 24 hours after departure)
+        min_flight_duration = bigint(1800)
+        max_flight_duration = bigint(86400)
+        if arr_ts < dep_ts + min_flight_duration:
+            raise _UserError("arrival_timestamp must be at least 30 minutes after departure_timestamp.")
+        if arr_ts > dep_ts + max_flight_duration:
+            raise _UserError("arrival_timestamp cannot exceed 24 hours after departure_timestamp.")
+
+        # Enforce purchase before departure lead time cutoff buffer
         if current_ts + self.min_purchase_lead_time > dep_ts:
             raise _UserError(
                 "Policy purchase must be made before flight departure lead time buffer."
@@ -213,7 +241,7 @@ class Contract(gl.Contract):
     def settle_policy(self, policy_id: str) -> None:
         """
         Triggers decentralized AI assessment of flight status from the authoritative tracking page.
-        Settlement is only eligible after scheduled arrival timestamp.
+        Settlement is only eligible after scheduled arrival timestamp and before claim window expires.
         Guarantees full payout or rejects settlement without altering policy.
         Reconciles total_reserved_payout in all cases.
         """
@@ -229,6 +257,12 @@ class Contract(gl.Contract):
         if current_ts < policy.arrival_timestamp:
             raise _UserError(
                 "Policy cannot be settled before scheduled arrival time."
+            )
+
+        # Enforce settlement claim window (must settle within 14 days of arrival)
+        if current_ts > policy.arrival_timestamp + self.max_settlement_window:
+            raise _UserError(
+                "Policy settlement window has expired (must be settled within 14 days of arrival)."
             )
 
         # Extract storage data to local variables BEFORE nondet block
@@ -268,7 +302,7 @@ AUTHORITATIVE TRACKING CONTENT:
 ASSESSMENT RULES:
 - "CANCELLED": Flight {flight_code_local} on {flight_date_local} was explicitly cancelled, aborted, or diverted without reaching destination.
 - "DELAYED": Flight arrival was delayed by 180 minutes (3 hours) or more compared to scheduled time.
-- "ON_TIME": Flight landed on schedule, early, or with a minor delay strictly under 180 minutes.
+- "ON_TIME": Flight landed on schedule, early, or with a minor delay strictly under 180 minutes. Also report "ON_TIME" if the flight record is for a different flight date or if the flight has not yet completed.
 
 OUTPUT FORMAT:
 Respond ONLY with a VALID JSON object (no markdown, no backticks):
@@ -428,6 +462,15 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             raise _UserError("Lead time cannot be negative.")
         self.min_purchase_lead_time = bigint(lead_time_seconds)
 
+    @gl.public.write
+    def set_max_settlement_window(self, window_seconds: int) -> None:
+        """Adjust the maximum settlement window in seconds (owner only)."""
+        if _addr_str(_get_sender()) != _addr_str(self.owner):
+            raise _UserError("Only contract owner can adjust settlement window.")
+        if window_seconds < 3600:
+            raise _UserError("Settlement window must be at least 1 hour.")
+        self.max_settlement_window = bigint(window_seconds)
+
     @gl.public.view
     def get_policy(self, policy_id: str) -> str:
         """Retrieve details of an insurance policy as a JSON string."""
@@ -479,6 +522,10 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
         return int(self.min_purchase_lead_time)
 
     @gl.public.view
+    def get_max_settlement_window(self) -> int:
+        return int(self.max_settlement_window)
+
+    @gl.public.view
     def get_contract_stats(self) -> str:
         return json.dumps({
             "owner": _addr_str(self.owner),
@@ -487,5 +534,6 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             "unreserved_liquidity": str(self.insurance_pool_balance - self.total_reserved_payout),
             "policy_count": str(self.policy_count),
             "payout_multiplier": str(self.payout_multiplier),
-            "min_purchase_lead_time": str(self.min_purchase_lead_time)
+            "min_purchase_lead_time": str(self.min_purchase_lead_time),
+            "max_settlement_window": str(self.max_settlement_window)
         })
