@@ -12,8 +12,7 @@
 
 The FlightDelayX Intelligent Contract is officially deployed and verified on GenLayer studionet:
 
-- **Contract Address:** `0x21d8aE56e1147Fa337bb985f59D4b2aFD11FA6C9`
-- **Deployment Transaction Hash:** `0x6ee04d48bcc752fb17aae1a9605ca4dbc3451b720056cc874f1767ee1f18243f`
+- **Contract Address:** `0x34D0347D153C0C6301b30492e07750A8F6700080`
 - **Deployment Network:** `studionet` (Chain ID: `61999` / `0xF1EF`)
 - **Execution Environment:** GenVM / Optimistic Democracy Semantic Consensus
 - **Contract Source:** [`contracts/flight_delay_x.py`](contracts/flight_delay_x.py)
