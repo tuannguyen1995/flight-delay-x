@@ -1,15 +1,12 @@
-# v0.2.16
 # { "Depends": "py-genlayer:1jb45aa8ynh2a9c9xn3b7qqh8sm5q93hwfp7jqmwsfhh8jpz09h6" }
 from genlayer import *
 from dataclasses import dataclass
-from datetime import datetime, timezone
 import json
 
-try:
-    _UserError = UserError
-except NameError:
-    class _UserError(Exception):
-        pass
+
+class UserError(Exception):
+    """Custom contract user error for GenVM reverts."""
+    pass
 
 
 def _addr_str(addr: Address) -> str:
@@ -28,17 +25,14 @@ def _get_sender() -> Address:
         try:
             return gl.message.sender_address
         except Exception:
-            raise _UserError("Cannot resolve sender address.")
+            raise UserError("Cannot resolve sender address.")
 
 
-def _validate_date_format(d_str: str) -> None:
-    """Validate that date string matches YYYY-MM-DD format."""
-    if len(d_str) != 10 or d_str[4] != "-" or d_str[7] != "-":
-        raise _UserError("flight_date must be in YYYY-MM-DD format.")
-    try:
-        datetime.strptime(d_str, "%Y-%m-%d")
-    except Exception:
-        raise _UserError("Invalid calendar date in flight_date.")
+def _safe_transfer(recipient: Address, amount: bigint) -> None:
+    """Safely disburse native GEN to an address using official GenLayer SDK pattern."""
+    if amount <= bigint(0):
+        return
+    gl.get_contract_at(recipient).emit_transfer(value=u256(int(amount)))
 
 
 @allow_storage
@@ -48,15 +42,14 @@ class InsurancePolicy:
     policy_id: str
     passenger: Address
     flight_code: str              # e.g., "VN210", "AA100"
-    flight_date: str              # e.g., "2026-09-25" (YYYY-MM-DD)
-    departure_timestamp: bigint   # Scheduled departure Unix timestamp (seconds)
-    arrival_timestamp: bigint     # Scheduled arrival Unix timestamp (seconds)
-    tracking_url: str             # Contract-generated authoritative URL
-    premium_paid: bigint          # Price paid for the policy
-    payout_amount: bigint         # Guaranteed payout if delayed/cancelled
+    flight_date: str              # e.g., "2026-10-05" (YYYY-MM-DD)
+    tracking_url: str             # Authoritative tracking source
+    premium_paid: bigint
+    payout_amount: bigint
     status: str                   # "ACTIVE", "PAID_OUT", "EXPIRED"
-    flight_status: str            # "PENDING", "DELAYED", "CANCELLED", "ON_TIME"
-    reason: str                   # AI Consensus explanation
+    flight_status: str            # "PENDING", "DELAYED", "CANCELLED", "ON_TIME", "INVALID_CLAIM"
+    purchase_timestamp: bigint
+    reason: str                   # AI Consensus breakdown
     created_at: bigint
     resolved_at: bigint
 
@@ -68,26 +61,22 @@ class Contract(gl.Contract):
     """
     owner: Address
     insurance_pool_balance: bigint
-    total_reserved_payout: bigint   # Total liability locked for all active policies
+    total_reserved_payout: bigint
     policy_count: bigint
-    payout_multiplier: bigint       # e.g., 3x premium as default payout
-    min_purchase_lead_time: bigint  # Cutoff buffer in seconds before departure (default 3600s)
-    max_settlement_window: bigint   # Maximum window to claim after arrival (default 14 days = 1209600s)
+    payout_multiplier: bigint
     policies: TreeMap[str, InsurancePolicy]
 
     def __init__(self):
         # GenVM automatically initializes TreeMap and DynArray fields.
-        # DO NOT reassign self.policies = TreeMap() here to prevent AssertionError.
         self.owner = _get_sender()
         self.insurance_pool_balance = bigint(0)
         self.total_reserved_payout = bigint(0)
         self.policy_count = bigint(0)
-        self.payout_multiplier = bigint(3)          # 3x payout multiplier
-        self.min_purchase_lead_time = bigint(3600)  # 1 hour cutoff buffer
-        self.max_settlement_window = bigint(1209600) # 14 days settlement window
+        self.payout_multiplier = bigint(3)
 
     def _get_current_timestamp(self) -> bigint:
         """Derive trusted timestamp from transaction execution context or datetime."""
+        from datetime import datetime, timezone
         try:
             if hasattr(gl, "message_raw") and isinstance(gl.message_raw, dict) and "datetime" in gl.message_raw:
                 dt_str = str(gl.message_raw["datetime"])
@@ -108,6 +97,16 @@ class Contract(gl.Contract):
             pass
         return bigint(int(datetime.now(timezone.utc).timestamp()))
 
+    def _validate_date_format(self, d_str: str) -> None:
+        """Validate that date string matches YYYY-MM-DD format and calendar validity."""
+        from datetime import datetime
+        if len(d_str) != 10 or d_str[4] != "-" or d_str[7] != "-":
+            raise UserError("flight_date must be in YYYY-MM-DD format.")
+        try:
+            datetime.strptime(d_str, "%Y-%m-%d")
+        except Exception:
+            raise UserError("Invalid calendar date in flight_date.")
+
     def _parse_llm_json(self, text: str) -> dict:
         """Safely parse LLM responses, stripping markdown wrappers if present."""
         try:
@@ -122,7 +121,7 @@ class Contract(gl.Contract):
         except Exception as e:
             return {
                 "flight_status": "ON_TIME",
-                "delay_minutes": 0,
+                "is_historical_exploit": False,
                 "confidence": 0,
                 "reason": f"Failed to parse LLM JSON: {str(e)[:100]}"
             }
@@ -132,87 +131,45 @@ class Contract(gl.Contract):
         """Underwriters deposit GEN liquidity to cover future flight claim payouts."""
         deposit = bigint(gl.message.value)
         if deposit <= bigint(0):
-            raise _UserError("Pool deposit must be greater than 0 GEN.")
+            raise UserError("Pool deposit must be greater than 0 GEN.")
         self.insurance_pool_balance += deposit
 
     @gl.public.write.payable
-    def buy_policy(
-        self,
-        flight_code: str,
-        flight_date: str,
-        departure_timestamp: int,
-        arrival_timestamp: int
-    ) -> str:
+    def buy_policy(self, flight_code: str, flight_date: str) -> str:
         """
         Passengers buy insurance for a specific flight on a specific date.
-        Strictly verifies that buyer-supplied timestamps match the flight date,
-        enforces purchase lead time, and underwrites strictly against unreserved liquidity.
+        Generates canonical tracking URL and reserves liquidity under strict solvency checks.
+        Rejects strictly historical dates on-chain.
         """
         premium = bigint(gl.message.value)
         if premium <= bigint(0):
-            raise _UserError("Premium paid must be greater than 0 GEN.")
+            raise UserError("Premium paid must be greater than 0 GEN.")
 
         clean_flight = flight_code.strip().upper()
         clean_date = flight_date.strip()
 
         if len(clean_flight) < 3:
-            raise _UserError("Invalid flight_code format (must be at least 3 characters).")
-        _validate_date_format(clean_date)
-
-        # Compute UTC bounds for the specified flight_date
-        flight_dt = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
-        day_start_ts = bigint(int(flight_dt.timestamp()))
-        day_end_ts = day_start_ts + bigint(86400)
+            raise UserError("Invalid flight_code format.")
+        self._validate_date_format(clean_date)
 
         current_ts = self._get_current_timestamp()
 
-        # Reject historical flight dates outright
-        if day_end_ts <= current_ts:
-            raise _UserError("Cannot purchase policy for a historical flight date.")
+        # Reject historical flight dates on-chain
+        from datetime import datetime, timezone
+        flight_dt = datetime.strptime(clean_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        day_end_ts = int(flight_dt.timestamp()) + 86400
+        if day_end_ts <= int(current_ts):
+            raise UserError("Cannot purchase policy for a historical flight date.")
 
-        dep_ts = bigint(departure_timestamp)
-        arr_ts = bigint(arrival_timestamp)
-
-        # Strictly verify departure_timestamp against the selected flight_date
-        if dep_ts < day_start_ts or dep_ts >= day_end_ts:
-            raise _UserError(
-                "departure_timestamp does not fall on the selected flight_date. "
-                "Departure must fall within the 24-hour UTC window of the specified date."
-            )
-
-        dep_date_str = datetime.fromtimestamp(int(dep_ts), tz=timezone.utc).strftime("%Y-%m-%d")
-        if dep_date_str != clean_date:
-            raise _UserError("departure_timestamp date does not match flight_date.")
-
-        # Scheduled arrival must be realistic (min 30 min, max 24 hours after departure)
-        min_flight_duration = bigint(1800)
-        max_flight_duration = bigint(86400)
-        if arr_ts < dep_ts + min_flight_duration:
-            raise _UserError("arrival_timestamp must be at least 30 minutes after departure_timestamp.")
-        if arr_ts > dep_ts + max_flight_duration:
-            raise _UserError("arrival_timestamp cannot exceed 24 hours after departure_timestamp.")
-
-        # Enforce purchase before departure lead time cutoff buffer
-        if current_ts + self.min_purchase_lead_time > dep_ts:
-            raise _UserError(
-                "Policy purchase must be made before flight departure lead time buffer."
-            )
-
-        # Authoritative contract-controlled source URL bound to flight code AND date
-        clean_url = f"https://flightaware.com/live/flight/{clean_flight}/history/{clean_date}"
-
+        # Contract binds strictly to flight code and date on canonical tracker
+        canonical_url = f"https://flightaware.com/live/flight/{clean_flight}/history/{clean_date}"
         payout = premium * self.payout_multiplier
 
-        # Verify pool solvency against unreserved liquidity:
-        # unreserved = pool_balance - total_reserved_payout
-        # available = unreserved + premium
+        # Verify pool solvency against unreserved liquidity
         unreserved_liquidity = self.insurance_pool_balance - self.total_reserved_payout
         if payout > unreserved_liquidity + premium:
-            raise _UserError(
-                "Insurance pool has insufficient unreserved liquidity to underwrite this policy."
-            )
+            raise UserError("Insurance pool has insufficient unreserved liquidity.")
 
-        # Lock full liability in total_reserved_payout
         self.insurance_pool_balance += premium
         self.total_reserved_payout += payout
         self.policy_count += bigint(1)
@@ -223,14 +180,13 @@ class Contract(gl.Contract):
             passenger=_get_sender(),
             flight_code=clean_flight,
             flight_date=clean_date,
-            departure_timestamp=dep_ts,
-            arrival_timestamp=arr_ts,
-            tracking_url=clean_url,
+            tracking_url=canonical_url,
             premium_paid=premium,
             payout_amount=payout,
             status="ACTIVE",
             flight_status="PENDING",
-            reason="Flight coverage active. Awaiting settlement check.",
+            purchase_timestamp=current_ts,
+            reason="Policy active. Bound to verified flight date and code.",
             created_at=self.policy_count,
             resolved_at=bigint(0)
         )
@@ -240,38 +196,23 @@ class Contract(gl.Contract):
     @gl.public.write
     def settle_policy(self, policy_id: str) -> None:
         """
-        Triggers decentralized AI assessment of flight status from the authoritative tracking page.
-        Settlement is only eligible after scheduled arrival timestamp and before claim window expires.
-        Guarantees full payout or rejects settlement without altering policy.
-        Reconciles total_reserved_payout in all cases.
+        AI validators inspect the authoritative flight history page on-chain.
+        Validators independently cross-reference the flight date and actual operational times
+        to ensure coverage was not purchased after the outcome was already determined.
         """
         if policy_id not in self.policies:
-            raise _UserError("Policy not found.")
+            raise UserError("Policy not found.")
 
         policy = self.policies[policy_id]
         if policy.status != "ACTIVE":
-            raise _UserError("Policy is not active or already settled.")
+            raise UserError("Policy is not active or already settled.")
 
-        # Enforce settlement only after eligibility (flight arrival time)
-        current_ts = self._get_current_timestamp()
-        if current_ts < policy.arrival_timestamp:
-            raise _UserError(
-                "Policy cannot be settled before scheduled arrival time."
-            )
-
-        # Enforce settlement claim window (must settle within 14 days of arrival)
-        if current_ts > policy.arrival_timestamp + self.max_settlement_window:
-            raise _UserError(
-                "Policy settlement window has expired (must be settled within 14 days of arrival)."
-            )
-
-        # Extract storage data to local variables BEFORE nondet block
         flight_code_local = str(policy.flight_code)
         flight_date_local = str(policy.flight_date)
         tracking_url_local = str(policy.tracking_url)
+        purchase_ts_local = int(policy.purchase_timestamp)
 
         def leader_fn():
-            # 1. Fetch authoritative flight status webpage
             web_text = ""
             try:
                 res = gl.nondet.web.render(tracking_url_local, mode="text")
@@ -282,33 +223,40 @@ class Contract(gl.Contract):
             if len(web_text.strip()) < 20:
                 return {
                     "flight_status": "ON_TIME",
-                    "delay_minutes": 0,
+                    "is_historical_exploit": False,
                     "confidence": 100,
                     "reason": "Tracking page offline or blank; defaulted to on-time."
                 }
 
             snippet = web_text[:4000]
 
-            # 2. Formulate Flight Status Audit Prompt strictly bound to flight code & date
             prompt = f"""You are an Autonomous Flight Claim Auditor on the GenLayer decentralized consensus network.
-Analyze the following flight status page content for FLIGHT CODE: {flight_code_local} on DATE: {flight_date_local}.
-Determine whether this specific flight was CANCELLED, DELAYED by 180 minutes or more, or arrived ON_TIME / minor delay.
+Analyze the following flight tracking content for FLIGHT: {flight_code_local} on DATE: {flight_date_local}.
+The insurance policy was purchased at Unix timestamp: {purchase_ts_local}.
 
-AUTHORITATIVE TRACKING CONTENT:
+TRACKING DATA:
 \"\"\"
 {snippet}
 \"\"\"
 
-ASSESSMENT RULES:
-- "CANCELLED": Flight {flight_code_local} on {flight_date_local} was explicitly cancelled, aborted, or diverted without reaching destination.
-- "DELAYED": Flight arrival was delayed by 180 minutes (3 hours) or more compared to scheduled time.
-- "ON_TIME": Flight landed on schedule, early, or with a minor delay strictly under 180 minutes. Also report "ON_TIME" if the flight record is for a different flight date or if the flight has not yet completed.
+LIFECYCLE & ELIGIBILITY VERIFICATION RULES:
+1. Verify if this flight record corresponds to flight {flight_code_local} on date {flight_date_local}.
+2. Check if the flight has completed its journey:
+   - If the flight is still scheduled in the future, delayed but not yet departed/landed, or currently in air:
+     return "flight_status": "NOT_CONCLUDED", "is_historical_exploit": false.
+3. Check for historical exploit:
+   - If the flight had already departed, was cancelled, or concluded BEFORE policy purchase timestamp {purchase_ts_local}:
+     return "flight_status": "INVALID_CLAIM", "is_historical_exploit": true.
+4. For legitimate completed flights purchased prior to departure:
+   - "CANCELLED": Flight was explicitly cancelled or diverted.
+   - "DELAYED": Flight arrival was delayed by 180 minutes (3 hours) or more compared to scheduled arrival.
+   - "ON_TIME": Flight landed on schedule or with minor delay under 180 minutes. Also return "ON_TIME" if data shows normal on-time operations.
 
 OUTPUT FORMAT:
 Respond ONLY with a VALID JSON object (no markdown, no backticks):
 {{
-  "flight_status": "CANCELLED" or "DELAYED" or "ON_TIME",
-  "delay_minutes": <integer>,
+  "flight_status": "CANCELLED" | "DELAYED" | "ON_TIME" | "NOT_CONCLUDED" | "INVALID_CLAIM",
+  "is_historical_exploit": true or false,
   "confidence": <integer 0 to 100>,
   "reason": "<concise explanation max 200 characters>"
 }}"""
@@ -332,13 +280,12 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                     parsed = json.loads(cleaned.strip())
 
                 status = str(parsed.get("flight_status", "ON_TIME")).strip().upper()
-                if status not in ("CANCELLED", "DELAYED", "ON_TIME"):
+                if status not in ("CANCELLED", "DELAYED", "ON_TIME", "NOT_CONCLUDED", "INVALID_CLAIM"):
                     status = "ON_TIME"
 
-                try:
-                    delay_m = int(parsed.get("delay_minutes", 0))
-                except Exception:
-                    delay_m = 0
+                is_exploit = bool(parsed.get("is_historical_exploit", False))
+                if is_exploit:
+                    status = "INVALID_CLAIM"
 
                 try:
                     conf = int(parsed.get("confidence", 0))
@@ -346,18 +293,18 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                 except Exception:
                     conf = 50
 
-                reason_str = str(parsed.get("reason", "Flight status evaluated by AI."))[:200]
+                reason_str = str(parsed.get("reason", "Evaluated by AI consensus."))[:200]
 
                 return {
                     "flight_status": status,
-                    "delay_minutes": delay_m,
+                    "is_historical_exploit": is_exploit,
                     "confidence": conf,
                     "reason": reason_str
                 }
             except Exception as e:
                 return {
                     "flight_status": "ON_TIME",
-                    "delay_minutes": 0,
+                    "is_historical_exploit": False,
                     "confidence": 0,
                     "reason": f"Audit execution failed: {str(e)[:100]}"
                 }
@@ -370,10 +317,11 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
                 return False
 
             mine = leader_fn()
-            # CRITICAL: Compare semantic flight_status ONLY
-            s_mine = str(mine.get("flight_status", "")).strip().upper()
-            s_leader = str(leader.get("flight_status", "")).strip().upper()
-            return s_mine == s_leader
+            # CRITICAL: STRICT MATCH ON FLIGHT STATUS & EXPLOIT DETECTION
+            return (
+                str(leader.get("flight_status", "")).strip().upper() == str(mine.get("flight_status", "")).strip().upper()
+                and bool(leader.get("is_historical_exploit", False)) == bool(mine.get("is_historical_exploit", False))
+            )
 
         adjudication_res = gl.vm.run_nondet(leader_fn, validator_fn)
         if isinstance(adjudication_res, dict):
@@ -382,24 +330,26 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             final_res = self._parse_llm_json(str(adjudication_res))
 
         flight_status = str(final_res.get("flight_status", "ON_TIME")).strip().upper()
-        if flight_status not in ("CANCELLED", "DELAYED", "ON_TIME"):
+        if flight_status not in ("CANCELLED", "DELAYED", "ON_TIME", "NOT_CONCLUDED", "INVALID_CLAIM"):
             flight_status = "ON_TIME"
 
-        reason = str(final_res.get("reason", "Consensus concluded."))
+        is_exploit = bool(final_res.get("is_historical_exploit", False))
+        if is_exploit:
+            flight_status = "INVALID_CLAIM"
 
+        # If flight has not concluded yet, reject settlement so it can be retried later
+        if flight_status == "NOT_CONCLUDED":
+            raise UserError("Flight has not concluded yet. Settlement only eligible after arrival or cancellation.")
+
+        reason = str(final_res.get("reason", "Consensus concluded."))
         passenger_addr = policy.passenger
         payout = policy.payout_amount
 
-        # Automatic trigger: Payout if CANCELLED or DELAYED >= 180 min
+        # Automatic trigger: Payout ONLY if CANCELLED or DELAYED >= 180 min
         if flight_status in ("CANCELLED", "DELAYED"):
-            # Enforce full payout guarantee without haircut:
-            # If pool balance is insufficient, reject settlement without modifying policy!
             if self.insurance_pool_balance < payout:
-                raise _UserError(
-                    "Pool balance insufficient to disburse full guaranteed payout. Settlement rejected without modifying policy."
-                )
+                raise UserError("Pool balance insufficient to disburse full payout.")
 
-            # Deduct both liquid balance and reserved liability
             self.insurance_pool_balance -= payout
             self.total_reserved_payout -= payout
 
@@ -409,86 +359,59 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             policy.resolved_at = self.policy_count
             self.policies[policy_id] = policy
 
-            # Transfer payout to passenger (cast to u256)
-            if payout > bigint(0):
-                gl.get_contract_at(passenger_addr).emit_transfer(value=u256(payout))
+            _safe_transfer(passenger_addr, payout)
         else:
-            # Flight was on-time: release reserved liability back to unreserved pool
+            # ON_TIME or INVALID_CLAIM (Historical exploit attempt): Policy expires with no payout
             self.total_reserved_payout -= payout
 
             policy.status = "EXPIRED"
-            policy.flight_status = "ON_TIME"
+            policy.flight_status = flight_status
             policy.reason = reason
             policy.resolved_at = self.policy_count
             self.policies[policy_id] = policy
 
     @gl.public.write
     def withdraw_pool(self, amount: int) -> None:
-        """
-        Underwriters / contract owner withdraws available surplus liquidity.
-        Strictly restricted to true surplus (pool balance minus total reserved liability).
-        """
+        """Underwriters / contract owner withdraws available surplus liquidity."""
         if _addr_str(_get_sender()) != _addr_str(self.owner):
-            raise _UserError("Only contract owner can withdraw pool liquidity.")
+            raise UserError("Only contract owner can withdraw pool liquidity.")
         amt = bigint(amount)
         if amt <= bigint(0):
-            raise _UserError("Withdrawal amount must be greater than 0.")
+            raise UserError("Withdrawal amount must be greater than 0.")
 
-        # Restrict withdrawals to true surplus
         true_surplus = self.insurance_pool_balance - self.total_reserved_payout
         if amt > true_surplus:
-            raise _UserError(
-                "Cannot withdraw reserved liability; only unreserved surplus can be withdrawn."
-            )
+            raise UserError("Cannot withdraw reserved liability; only unreserved surplus can be withdrawn.")
 
         self.insurance_pool_balance -= amt
-        gl.get_contract_at(self.owner).emit_transfer(value=u256(amt))
+        _safe_transfer(self.owner, amt)
 
     @gl.public.write
     def set_payout_multiplier(self, multiplier: int) -> None:
         """Adjust the payout multiplier for new insurance policies (owner only)."""
         if _addr_str(_get_sender()) != _addr_str(self.owner):
-            raise _UserError("Only contract owner can adjust payout multiplier.")
+            raise UserError("Only contract owner can adjust payout multiplier.")
         if multiplier < 1:
-            raise _UserError("Multiplier must be at least 1.")
+            raise UserError("Multiplier must be at least 1.")
         self.payout_multiplier = bigint(multiplier)
-
-    @gl.public.write
-    def set_min_purchase_lead_time(self, lead_time_seconds: int) -> None:
-        """Adjust the purchase cutoff lead time buffer in seconds (owner only)."""
-        if _addr_str(_get_sender()) != _addr_str(self.owner):
-            raise _UserError("Only contract owner can adjust lead time buffer.")
-        if lead_time_seconds < 0:
-            raise _UserError("Lead time cannot be negative.")
-        self.min_purchase_lead_time = bigint(lead_time_seconds)
-
-    @gl.public.write
-    def set_max_settlement_window(self, window_seconds: int) -> None:
-        """Adjust the maximum settlement window in seconds (owner only)."""
-        if _addr_str(_get_sender()) != _addr_str(self.owner):
-            raise _UserError("Only contract owner can adjust settlement window.")
-        if window_seconds < 3600:
-            raise _UserError("Settlement window must be at least 1 hour.")
-        self.max_settlement_window = bigint(window_seconds)
 
     @gl.public.view
     def get_policy(self, policy_id: str) -> str:
         """Retrieve details of an insurance policy as a JSON string."""
         if policy_id not in self.policies:
-            raise _UserError("Policy not found.")
+            raise UserError("Policy not found.")
         p = self.policies[policy_id]
         return json.dumps({
             "policy_id": p.policy_id,
             "passenger": _addr_str(p.passenger),
             "flight_code": p.flight_code,
             "flight_date": p.flight_date,
-            "departure_timestamp": str(p.departure_timestamp),
-            "arrival_timestamp": str(p.arrival_timestamp),
             "tracking_url": p.tracking_url,
             "premium_paid": str(p.premium_paid),
             "payout_amount": str(p.payout_amount),
             "status": p.status,
             "flight_status": p.flight_status,
+            "purchase_timestamp": str(p.purchase_timestamp),
             "reason": p.reason,
             "created_at": str(p.created_at),
             "resolved_at": str(p.resolved_at)
@@ -496,17 +419,14 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
 
     @gl.public.view
     def get_pool_balance(self) -> int:
-        """Total funds currently in the insurance contract pool."""
         return int(self.insurance_pool_balance)
 
     @gl.public.view
     def get_reserved_payout(self) -> int:
-        """Total liabilities reserved for active policies."""
         return int(self.total_reserved_payout)
 
     @gl.public.view
     def get_unreserved_liquidity(self) -> int:
-        """Unreserved surplus liquidity available to underwrite new policies."""
         return int(self.insurance_pool_balance - self.total_reserved_payout)
 
     @gl.public.view
@@ -518,14 +438,6 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
         return int(self.payout_multiplier)
 
     @gl.public.view
-    def get_min_purchase_lead_time(self) -> int:
-        return int(self.min_purchase_lead_time)
-
-    @gl.public.view
-    def get_max_settlement_window(self) -> int:
-        return int(self.max_settlement_window)
-
-    @gl.public.view
     def get_contract_stats(self) -> str:
         return json.dumps({
             "owner": _addr_str(self.owner),
@@ -533,7 +445,5 @@ Respond ONLY with a VALID JSON object (no markdown, no backticks):
             "total_reserved_payout": str(self.total_reserved_payout),
             "unreserved_liquidity": str(self.insurance_pool_balance - self.total_reserved_payout),
             "policy_count": str(self.policy_count),
-            "payout_multiplier": str(self.payout_multiplier),
-            "min_purchase_lead_time": str(self.min_purchase_lead_time),
-            "max_settlement_window": str(self.max_settlement_window)
+            "payout_multiplier": str(self.payout_multiplier)
         })

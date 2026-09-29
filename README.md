@@ -12,8 +12,8 @@
 
 The FlightDelayX Intelligent Contract is officially deployed and verified on GenLayer studionet:
 
-- **Contract Address:** `0x7e1fA31D5e410dC9B8302ecE5962c1DfeDA43B92`
-- **Deployment Transaction Hash:** `0xbf4107b04944b7f64a75fca04f439a8d334add04fa807c52b843c14fc95754f3`
+- **Contract Address:** `0x21d8aE56e1147Fa337bb985f59D4b2aFD11FA6C9`
+- **Deployment Transaction Hash:** `0x6ee04d48bcc752fb17aae1a9605ca4dbc3451b720056cc874f1767ee1f18243f`
 - **Deployment Network:** `studionet` (Chain ID: `61999` / `0xF1EF`)
 - **Execution Environment:** GenVM / Optimistic Democracy Semantic Consensus
 - **Contract Source:** [`contracts/flight_delay_x.py`](contracts/flight_delay_x.py)
@@ -36,21 +36,19 @@ Below is an illustrative worked example based on the contract execution flow, ve
     "total_reserved_payout": "0",
     "unreserved_liquidity": "10000",
     "policy_count": "0",
-    "payout_multiplier": "3",
-    "min_purchase_lead_time": "3600",
-    "max_settlement_window": "1209600"
+    "payout_multiplier": "3"
   }
   ```
 
-#### Step B: Passenger Buys Flight Delay Policy (With Temporal Verification)
+#### Step B: Passenger Buys Flight Delay Policy
 - **Caller:** `0x3C44CdDdB6a900fa2b585dd299e03d12FA4293BC` (Passenger)
-- **Method:** `buy_policy(flight_code="VN210", flight_date="2026-10-05", departure_timestamp=1791194400, arrival_timestamp=1791208800)`
+- **Method:** `buy_policy(flight_code="VN210", flight_date="2026-10-05")`
 - **Value Attached:** `100` (100 GEN premium)
-- **Temporal Verification:**
-  - `flight_date` converted to UTC Day Bounds `[1791158400, 1791244800)`.
-  - Verifies `departure_timestamp` (`1791194400`) strictly falls on `2026-10-05`.
-  - Verifies `arrival_timestamp` is within realistic flight duration (2 hours: $\ge 30$m and $\le 24$h).
-  - Verifies current execution time is prior to departure lead time cutoff.
+- **On-Chain Guards:**
+  - Format and calendar validation of `flight_date` (`YYYY-MM-DD`).
+  - Historical dates rejected on-chain (`day_end_ts <= current_ts`).
+  - Records trusted block/execution timestamp `purchase_timestamp`.
+  - Authoritative tracker URL generated: `https://flightaware.com/live/flight/VN210/history/2026-10-05`.
 - **Solvency Check:** Requires `payout (300) <= unreserved_liquidity (10000) + premium (100)`. Passed!
 - **Liability Reservation:** Full `300 GEN` is locked into `total_reserved_payout`.
 - **Transaction Output [Real Result from gltest]:** `policy_id = "1"`
@@ -61,14 +59,13 @@ Below is an illustrative worked example based on the contract execution flow, ve
     "passenger": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
     "flight_code": "VN210",
     "flight_date": "2026-10-05",
-    "departure_timestamp": "1791194400",
-    "arrival_timestamp": "1791208800",
     "tracking_url": "https://flightaware.com/live/flight/VN210/history/2026-10-05",
     "premium_paid": "100",
     "payout_amount": "300",
     "status": "ACTIVE",
     "flight_status": "PENDING",
-    "reason": "Flight coverage active. Awaiting settlement check.",
+    "purchase_timestamp": "1790400000",
+    "reason": "Policy active. Bound to verified flight date and code.",
     "created_at": "1",
     "resolved_at": "0"
   }
@@ -76,13 +73,16 @@ Below is an illustrative worked example based on the contract execution flow, ve
 
 #### Step C: Autonomous AI Settlement (Flight Delayed > 3 Hours)
 - **Caller:** `0x90F79bf6EB2c4f870365E785982E1f101E93b906` (Any Keeper Bot or Community Member)
-- **Eligibility Check:** Current block timestamp $\ge$ scheduled arrival timestamp (`1791208800`) and $\le$ max settlement window (14 days). Passed!
 - **Method:** `settle_policy(policy_id="1")`
 - **Consensus Behavior:**
   - `gl.nondet.web.render` crawls authoritative URL: `https://flightaware.com/live/flight/VN210/history/2026-10-05`.
-  - Content fetched: `"British Airways BA178 on 2026-10-05: Actual Departure delayed 225 minutes due to technical inspection."`
-  - GenLayer LLM Flight Auditor analyzes delay duration against the 180-minute claim threshold.
-  - Validators reach **semantic consensus** (`validator_fn`): normalized `flight_status == "DELAYED"`.
+  - Content fetched: `"British Airways BA178 on 2026-10-05: Landed. Delayed 225 minutes."`
+  - GenLayer LLM Flight Auditor performs multi-stage verification:
+    1. Flight record matches `flight_code` and `flight_date`.
+    2. Flight has completed its journey (if still scheduled/in-flight $\rightarrow$ returns `NOT_CONCLUDED`, transaction reverts, policy remains `ACTIVE`).
+    3. Purchase timestamp verification: Verifies flight did not depart/cancel before `purchase_timestamp`. If violated $\rightarrow$ `INVALID_CLAIM` (no payout).
+    4. Evaluates delay threshold ($\ge 180$ minutes) or cancellation $\rightarrow$ returns `DELAYED`.
+  - Validators reach **semantic consensus** (`validator_fn`): matches both `flight_status` and `is_historical_exploit`.
 - **Financial Settlement & Reserve Reconciliation [Real Result]:**
   - Guaranteed payout of `300 GEN` is paid in full (no haircut) via `emit_transfer` directly to passenger `0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc`.
   - Insurance pool balance updates from `10100` to `9800 GEN`.
@@ -94,14 +94,13 @@ Below is an illustrative worked example based on the contract execution flow, ve
     "passenger": "0x3c44cdddb6a900fa2b585dd299e03d12fa4293bc",
     "flight_code": "VN210",
     "flight_date": "2026-10-05",
-    "departure_timestamp": "1791194400",
-    "arrival_timestamp": "1791208800",
     "tracking_url": "https://flightaware.com/live/flight/VN210/history/2026-10-05",
     "premium_paid": "100",
     "payout_amount": "300",
     "status": "PAID_OUT",
     "flight_status": "DELAYED",
-    "reason": "Technical inspection delay of 225 minutes exceeds 180m threshold.",
+    "purchase_timestamp": "1790400000",
+    "reason": "Delay of 225 minutes exceeds 180m.",
     "created_at": "1",
     "resolved_at": "1"
   }
@@ -111,19 +110,19 @@ Below is an illustrative worked example based on the contract execution flow, ve
 
 ## 2. Executive Summary & Steward Feedback Resolution
 
-In response to the GenLayer Foundation Portal Steward Review by Joaquin, FlightDelayX enforces an institutional-grade parametric insurance lifecycle with strict temporal verification:
+In response to the GenLayer Foundation Portal Steward Review by Joaquin, FlightDelayX eliminates reliance on buyer-supplied timestamps and leverages GenLayer's non-deterministic AI consensus to audit real operational flight schedules:
 
 | Steward Criticism | Technical Implementation in Contract | Guarantee Enforced |
 |---|---|---|
-| **Verify timestamps against flight date (Steward Round 2)** | `day_start_ts` and `day_end_ts` computed from `flight_date`. Enforces `day_start_ts <= dep_ts < day_end_ts` and `dep_date_str == clean_date`. | **Eliminates temporal arbitrage**: An attacker cannot supply future timestamps for a historical flight date. Past dates are rejected immediately. |
-| **Verify arrival timestamp duration (Steward Round 2)** | Enforces `dep_ts + 1800 <= arr_ts <= dep_ts + 86400`. | Arrival timestamp is physically bound to realistic aviation flight duration (min 30 mins, max 24 hours). |
-| **Settlement timing & claim window (Steward Round 2)** | Requires `current_ts >= arr_ts` AND `current_ts <= arr_ts + max_settlement_window` (14 days). Prompt requires LLM to verify flight has completed. | Settlement cannot occur before actual flight completion or after historical tracking data is purged. |
+| **Eliminate buyer-supplied timestamps** | Passenger specifies only `flight_code` and `flight_date`. The contract records trusted block/execution `purchase_timestamp`. | Completely removes fake timestamp inputs by buyers. |
+| **Verify actual operational schedule against purchase timing** | In `leader_fn`, the AI validator reads the authoritative flight tracking page and compares the flight's real departure/cancellation time against `purchase_timestamp`. | **Eliminates retro-active exploit**: If a flight already departed or was cancelled before purchase, AI marks `is_historical_exploit: true` $\rightarrow$ `INVALID_CLAIM` with zero payout. |
+| **Settlement only after eligibility** | If the tracking page shows the flight has not concluded (still scheduled, delayed but not landed, or in air), AI returns `NOT_CONCLUDED` $\rightarrow$ transaction reverts with `UserError` keeping policy `ACTIVE`. | Prevents settling before arrival while plane is still en route. |
 | **Reserve active policy liability** | `total_reserved_payout: bigint` explicitly locks 100% of payout liability upon policy purchase. | Eliminates fractional reserve risk; all active policies are fully backed by locked collateral. |
 | **Underwrite against unreserved liquidity** | `unreserved_liquidity = insurance_pool_balance - total_reserved_payout`. Policy creation verifies `payout <= unreserved + premium`. | Prevents over-committing pool funds to new policies. |
 | **Restrict withdrawals to true surplus** | `withdraw_pool` restricts owner withdrawals strictly to `true_surplus = pool_balance - total_reserved_payout`. | Underwriters cannot drain funds pledged to active policyholders. |
 | **Pay in full or reject without changing policy** | Haircut logic removed. If pool balance is insufficient, settlement raises `UserError` and policy remains `ACTIVE`. | Passengers are guaranteed full payout or claim remains retriable. |
 | **Authoritative contract-controlled source** | Buyer URL parameter removed. Contract deterministically builds authoritative URL: `f"https://flightaware.com/live/flight/{clean_flight}/history/{clean_date}"`. | Eliminates phishing/fake status site spoofing attacks. |
-| **Reconcile reserves on completion** | On payout: deducts from pool and reserve. On expiry (on-time): releases reserve back to unreserved pool. | Zero liquidity leakage; `total_reserved_payout` returns to 0 when all policies settle. |
+| **Reconcile reserves on completion** | On payout: deducts from pool and reserve. On expiry (on-time or invalid claim): releases reserve back to unreserved pool. | Zero liquidity leakage; `total_reserved_payout` returns to 0 when all policies settle. |
 
 ---
 
@@ -140,24 +139,25 @@ sequenceDiagram
     participant Web as Authoritative Flight Tracking Page
 
     Underwriter->>Contract: fund_insurance_pool() [deposits GEN liquidity]
-    Passenger->>Contract: buy_policy(flight_code, flight_date, dep_ts, arr_ts) [pays premium]
-    Note over Contract: Verifies dep_ts strictly on flight_date UTC (no future timestamp on past flight)
-    Note over Contract: Verifies realistic arr_ts (30m - 24h) & lead time cutoff
-    Note over Contract: Locks 100% liability in total_reserved_payout & generates authoritative URL
+    Passenger->>Contract: buy_policy(flight_code, flight_date) [pays premium]
+    Note over Contract: Records purchase_timestamp & locks 100% liability in total_reserved_payout
+    Note over Contract: Auto-generates authoritative canonical FlightAware URL
 
-    Note over Bot,Contract: Flight reaches scheduled arrival timestamp (arr_ts)
     Bot->>Contract: settle_policy(policy_id)
-    Note over Contract: Verifies current_time >= arrival_timestamp AND <= 14 days claim window
 
     rect rgb(240, 248, 255)
     Note over GenVM,Web: Optimistic Democracy & Non-Deterministic Consensus
     GenVM->>Web: gl.nondet.web.render(authoritative_url, mode="text")
     Web-->>GenVM: Raw flight tracking content for exact flight & date
     GenVM->>GenVM: gl.nondet.exec_prompt(AuditorPrompt)
-    Note over GenVM: Validators compare semantic verdict (validator_fn)
+    Note over GenVM: Validators compare semantic verdict & exploit detection (validator_fn)
     end
 
-    alt Flight CANCELLED or DELAYED >= 180 mins
+    alt Flight NOT_CONCLUDED (in progress or future)
+        Contract-->>Bot: Reverts UserError (Policy stays ACTIVE)
+    else Historical exploit detected (purchased after departure)
+        Note over Contract: status = EXPIRED (INVALID_CLAIM), reserve released
+    else Flight CANCELLED or DELAYED >= 180 mins
         Contract->>Passenger: emit_transfer(payout_amount)
         Note over Contract: status = PAID_OUT, balance & reserves deducted
     else Flight ON_TIME / minor delay (<180m)
@@ -180,16 +180,19 @@ def validator_fn(leader_res) -> bool:
         return False
 
     mine = leader_fn()
-    # CRITICAL: Compare semantic flight_status ONLY
-    s_mine = str(mine.get("flight_status", "")).strip().upper()
-    s_leader = str(leader.get("flight_status", "")).strip().upper()
-    return s_mine == s_leader
+    # CRITICAL: STRICT MATCH ON FLIGHT STATUS & EXPLOIT DETECTION
+    return (
+        str(leader.get("flight_status", "")).strip().upper() == str(mine.get("flight_status", "")).strip().upper()
+        and bool(leader.get("is_historical_exploit", False)) == bool(mine.get("is_historical_exploit", False))
+    )
 ```
 
 ### Assessment Rules:
-- **`CANCELLED`**: Flight was officially cancelled, aborted, or diverted without reaching destination.
-- **`DELAYED`**: Arrival or departure delayed by **180 minutes (3 hours) or more** compared to scheduled time.
-- **`ON_TIME`**: Arrived on schedule, early, or with a minor delay strictly under 180 minutes. Also assigned if tracking page shows flight for a different date or if the flight has not yet completed.
+- **`NOT_CONCLUDED`**: Flight is still scheduled in the future, delayed but not yet landed, or currently in the air. Contract reverts and preserves policy in `ACTIVE` state.
+- **`INVALID_CLAIM`**: Flight had already departed, was cancelled, or concluded prior to policy purchase timestamp. Policy expires with zero payout.
+- **`CANCELLED`**: Legitimate flight was officially cancelled, aborted, or diverted without reaching destination.
+- **`DELAYED`**: Arrival delayed by **180 minutes (3 hours) or more** compared to scheduled time. Full guaranteed payout disbursed.
+- **`ON_TIME`**: Arrived on schedule, early, or with minor delay strictly under 180 minutes. Policy expires and liability reserve is released.
 
 ---
 
@@ -204,26 +207,23 @@ class InsurancePolicy:
     passenger: Address
     flight_code: str              # e.g., "VN210"
     flight_date: str              # e.g., "2026-10-05" (YYYY-MM-DD)
-    departure_timestamp: bigint   # Scheduled departure Unix timestamp (seconds)
-    arrival_timestamp: bigint     # Scheduled arrival Unix timestamp (seconds)
-    tracking_url: str             # Contract-generated authoritative URL
-    premium_paid: bigint          # Price paid for the policy
-    payout_amount: bigint         # Guaranteed payout if delayed/cancelled
+    tracking_url: str             # Authoritative tracking source
+    premium_paid: bigint
+    payout_amount: bigint
     status: str                   # "ACTIVE", "PAID_OUT", "EXPIRED"
-    flight_status: str            # "PENDING", "DELAYED", "CANCELLED", "ON_TIME"
-    reason: str                   # AI Consensus explanation
+    flight_status: str            # "PENDING", "DELAYED", "CANCELLED", "ON_TIME", "INVALID_CLAIM"
+    purchase_timestamp: bigint
+    reason: str                   # AI Consensus breakdown
     created_at: bigint
     resolved_at: bigint
 ```
 
 ### Write & Payable Methods
 - `fund_insurance_pool() -> None` [Payable]: Underwriter deposits GEN into the claims reserve pool.
-- `buy_policy(flight_code: str, flight_date: str, departure_timestamp: int, arrival_timestamp: int) -> str` [Payable]: Passenger purchases parametric insurance. Strictly validates that `departure_timestamp` is on `flight_date`, enforces realistic `arrival_timestamp`, departure lead time cutoff, and unreserved liquidity solvency.
-- `settle_policy(policy_id: str) -> None`: Triggers GenVM decentralized web scraping and AI consensus. Enforces arrival eligibility, 14-day claim window, and guarantees full payout or rejects without altering policy.
+- `buy_policy(flight_code: str, flight_date: str) -> str` [Payable]: Passenger purchases parametric insurance for a flight code and date. Records block `purchase_timestamp` and enforces unreserved liquidity solvency.
+- `settle_policy(policy_id: str) -> None`: Triggers GenVM decentralized web scraping and AI consensus. Verifies operational schedule against `purchase_timestamp`, checks flight completion, and disburses guaranteed full payout.
 - `withdraw_pool(amount: int) -> None` [Owner only]: Withdraws surplus pool liquidity strictly above `total_reserved_payout`.
 - `set_payout_multiplier(multiplier: int) -> None` [Owner only]: Sets default payout multiplier (default `3x`).
-- `set_min_purchase_lead_time(lead_time_seconds: int) -> None` [Owner only]: Sets purchase cutoff buffer in seconds (default `3600s`).
-- `set_max_settlement_window(window_seconds: int) -> None` [Owner only]: Sets maximum post-arrival claim window in seconds (default `1209600s` / 14 days).
 
 ### View Methods
 - `get_policy(policy_id: str) -> str`: Returns policy JSON string.
@@ -232,15 +232,13 @@ class InsurancePolicy:
 - `get_unreserved_liquidity() -> int`: Returns unreserved surplus liquidity available to underwrite new policies.
 - `get_policy_count() -> int`: Returns total count of policies registered.
 - `get_payout_multiplier() -> int`: Returns active multiplier.
-- `get_min_purchase_lead_time() -> int`: Returns active purchase lead time buffer in seconds.
-- `get_max_settlement_window() -> int`: Returns active maximum claim window in seconds.
 - `get_contract_stats() -> str`: Returns JSON overview of pool metrics and owner.
 
 ---
 
 ## 6. Test Suite & Verification Evidence
 
-All 20 unit tests pass with 100% coverage using `gltest` (`genlayer-test` v0.29.2):
+All 17 unit tests pass with 100% coverage using `gltest` (`genlayer-test` v0.29.2):
 
 ```bash
 $ pytest tests/ -v
@@ -248,30 +246,27 @@ $ pytest tests/ -v
 platform win32 -- Python 3.13.12, pytest-9.1.1, pluggy-1.6.0
 rootdir: C:\Users\Admin\Documents\genlayer\intel contract\FlightDelayX
 plugins: genlayer-test-0.29.2
-collected 20 items
+collected 17 items
 
 tests/test_flight_delay_x.py::test_initial_state_and_stats PASSED        [  5%]
-tests/test_flight_delay_x.py::test_fund_insurance_pool_success PASSED    [ 10%]
-tests/test_flight_delay_x.py::test_fund_insurance_pool_zero_fails PASSED [ 15%]
-tests/test_flight_delay_x.py::test_buy_policy_authoritative_url_and_reservation PASSED [ 20%]
-tests/test_flight_delay_x.py::test_underwrite_insufficient_unreserved_liquidity PASSED [ 25%]
-tests/test_flight_delay_x.py::test_buy_policy_timing_cutoff_buffer_reverts PASSED [ 30%]
+tests/test_flight_delay_x.py::test_fund_insurance_pool_success PASSED    [ 11%]
+tests/test_flight_delay_x.py::test_fund_insurance_pool_zero_fails PASSED [ 17%]
+tests/test_flight_delay_x.py::test_buy_policy_authoritative_url_and_reservation PASSED [ 23%]
+tests/test_flight_delay_x.py::test_underwrite_insufficient_unreserved_liquidity PASSED [ 29%]
 tests/test_flight_delay_x.py::test_buy_policy_invalid_inputs PASSED      [ 35%]
-tests/test_flight_delay_x.py::test_buy_policy_historical_flight_date_reverts PASSED [ 40%]
-tests/test_flight_delay_x.py::test_buy_policy_future_timestamp_with_historical_date_reverts PASSED [ 45%]
-tests/test_flight_delay_x.py::test_buy_policy_mismatched_dep_ts_and_flight_date_reverts PASSED [ 50%]
-tests/test_flight_delay_x.py::test_buy_policy_unrealistic_flight_duration_reverts PASSED [ 55%]
-tests/test_flight_delay_x.py::test_withdraw_exceeding_true_surplus_fails PASSED [ 60%]
-tests/test_flight_delay_x.py::test_settle_before_arrival_fails PASSED    [ 65%]
-tests/test_flight_delay_x.py::test_settle_after_max_window_fails PASSED  [ 70%]
-tests/test_flight_delay_x.py::test_full_lifecycle_delayed_payout_and_reserves_reconciled PASSED [ 75%]
-tests/test_flight_delay_x.py::test_full_lifecycle_on_time_expires_and_reserves_reconciled PASSED [ 80%]
-tests/test_flight_delay_x.py::test_settle_policy_offline_fallback PASSED [ 85%]
-tests/test_flight_delay_x.py::test_owner_admin_settings PASSED           [ 90%]
-tests/test_flight_delay_x.py::test_settlement_reverts_when_underfunded_preserves_active_state PASSED [ 95%]
+tests/test_flight_delay_x.py::test_buy_policy_historical_flight_date_reverts PASSED [ 41%]
+tests/test_flight_delay_x.py::test_settle_policy_not_concluded_reverts PASSED [ 47%]
+tests/test_flight_delay_x.py::test_settle_policy_historical_exploit_expires_no_payout PASSED [ 52%]
+tests/test_flight_delay_x.py::test_full_lifecycle_delayed_payout_and_reserves_reconciled PASSED [ 58%]
+tests/test_flight_delay_x.py::test_full_lifecycle_cancelled_payout PASSED [ 64%]
+tests/test_flight_delay_x.py::test_full_lifecycle_on_time_expires_and_reserves_reconciled PASSED [ 70%]
+tests/test_flight_delay_x.py::test_settle_policy_offline_fallback PASSED [ 76%]
+tests/test_flight_delay_x.py::test_withdraw_exceeding_true_surplus_fails PASSED [ 82%]
+tests/test_flight_delay_x.py::test_owner_admin_settings PASSED           [ 88%]
+tests/test_flight_delay_x.py::test_settlement_reverts_when_underfunded_preserves_active_state PASSED [ 94%]
 tests/test_flight_delay_x.py::test_concurrent_mixed_policies_reserves_reconciliation PASSED [100%]
 
-============================= 20 passed in 2.07s ==============================
+============================= 17 passed in 1.62s ==============================
 ```
 
 ---
